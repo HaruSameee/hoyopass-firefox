@@ -15,7 +15,7 @@ Firefox で HoYoLAB に一度ログインしておくだけです。
 ・設定と履歴はお使いの PC にだけ保存されます。解析やテレメトリは一切送信しません
 
 ■ 権限が必要な理由
-・hoyolab.com / hoyoverse.com / mihoyo.com：ログボ受取とコード交換の API を呼ぶため
+・hoyolab.com / hoyoverse.com：ログボ受取とコード交換の API を呼ぶため
 ・hoyo-codes.seria.moe：交換コード一覧を取得するため
 ・alarms：定期実行のため ／ storage：設定と履歴を保存するため
 
