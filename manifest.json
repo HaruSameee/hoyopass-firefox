@@ -1,1 +1,38 @@
-{"action":{"default_popup":"popup.html","default_title":"HoYoPass"},"background":{"scripts":["background.js"],"service_worker":"background.js","type":"module"},"browser_specific_settings":{"gecko":{"id":"hoyopass-firefox@aynm.dev","strict_min_version":"121.0"}},"description":"HoYoLABのデイリーログインボーナスと交換コードを自動で受け取る非公式拡張機能（原神 / スターレイル / ゼンゼロ）","host_permissions":["*://*.hoyolab.com/*","*://*.hoyoverse.com/*","*://*.mihoyo.com/*","https://hoyo-codes.seria.moe/*"],"manifest_version":3,"name":"HoYoPass for Firefox (unofficial)","permissions":["alarms","storage"],"version":"0.1.0"}
+{
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "HoYoPass"
+  },
+  "background": {
+    "scripts": [
+      "background.js"
+    ],
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "hoyopass-firefox@aynm.dev",
+      "strict_min_version": "121.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  },
+  "description": "HoYoLABのデイリーログインボーナスと交換コードを自動で受け取る非公式拡張機能（原神 / スターレイル / ゼンゼロ）",
+  "host_permissions": [
+    "*://*.hoyolab.com/*",
+    "*://*.hoyoverse.com/*",
+    "*://*.mihoyo.com/*",
+    "https://hoyo-codes.seria.moe/*"
+  ],
+  "manifest_version": 3,
+  "name": "HoYoPass for Firefox (unofficial)",
+  "permissions": [
+    "alarms",
+    "storage"
+  ],
+  "version": "0.1.0"
+}
