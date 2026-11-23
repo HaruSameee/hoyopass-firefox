@@ -29,7 +29,7 @@
     "https://hoyo-codes.seria.moe/*"
   ],
   "manifest_version": 3,
-  "name": "HoYoPass for Firefox (unofficial)",
+  "name": "HoYoPass for Fx (unofficial)",
   "permissions": [
     "alarms",
     "storage"
