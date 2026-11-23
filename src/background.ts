@@ -111,6 +111,21 @@ interface CodeAttempt {
   retcode?: number;
   message?: string;
 }
+/** Why a run started. Threaded from every call site so the popup can show
+ *  whether a run was scheduled, a catch-up, or a manual click. */
+type Trigger = "alarm" | "startup" | "installed" | "manual";
+type RunKind = "checkin" | "codes";
+/** Single-flight lock for one run kind, kept in storage (not memory) because
+ *  the background context is non-persistent. `at` is the acquisition time;
+ *  locks older than LOCK_TTL_MS are treated as stale and taken over. */
+interface RunLock {
+  at: number;
+  trigger: Trigger;
+}
+interface TriggerInfo {
+  trigger: Trigger;
+  at: number;
+}
 interface State {
   settings: Settings;
   runs: Record<string, GameRunStatus>;
@@ -118,6 +133,8 @@ interface State {
   lastCodesRun?: number;
   attempts: Record<string, Record<string, CodeAttempt>>;
   stats: { totalRedeemed: number; activeCounts: Record<string, number> };
+  locks: Partial<Record<RunKind, RunLock>>;
+  lastTriggers: Partial<Record<RunKind, TriggerInfo>>;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -134,6 +151,8 @@ async function loadState(): Promise<State> {
     "lastCodesRun",
     "attempts",
     "stats",
+    "locks",
+    "lastTriggers",
   ]);
   return {
     settings: {
@@ -144,11 +163,57 @@ async function loadState(): Promise<State> {
     lastCodesRun: raw.lastCodesRun,
     attempts: raw.attempts ?? {},
     stats: raw.stats ?? { totalRedeemed: 0, activeCounts: {} },
+    locks: raw.locks ?? {},
+    lastTriggers: raw.lastTriggers ?? {},
   };
 }
 
 async function saveState(patch: Partial<State>): Promise<void> {
   await ext.storage.local.set(patch);
+}
+
+// ---------------------------------------------------------------------------
+// Single-flight locks (duplicate-run guard)
+// ---------------------------------------------------------------------------
+
+/** A lock older than this is assumed to belong to a crashed/unloaded run
+ *  and is taken over. A full codes run takes minutes (pacing per code),
+ *  so 15 minutes leaves generous headroom over a legitimate run. */
+const LOCK_TTL_MS = 15 * 60 * 1000;
+
+/** In-memory first line of defense: alarms, startup and popup messages are
+ *  normally dispatched to this same background instance while it is alive,
+ *  so a synchronous Set check closes the common overlap race before the
+ *  async storage lock is even consulted. The storage lock below is the
+ *  durable layer that survives background unloads. */
+const activeRuns = new Set<RunKind>();
+
+/** Tries to take the lock for `kind` and records the trigger. Returns false
+ *  when a fresh lock is already held (caller must skip its run). A stale
+ *  lock is overwritten (takeover). Storage get/set is not atomic, so two
+ *  brand-new background instances racing in the same instant could both
+ *  pass; the in-memory set above covers the realistic same-instance case. */
+async function acquireLock(kind: RunKind, trigger: Trigger): Promise<boolean> {
+  const raw = await ext.storage.local.get(["locks", "lastTriggers"]);
+  const locks: Partial<Record<RunKind, RunLock>> = raw.locks ?? {};
+  const now = Date.now();
+  const existing = locks[kind];
+  if (existing && now - existing.at < LOCK_TTL_MS) return false;
+  locks[kind] = { at: now, trigger };
+  const lastTriggers: Partial<Record<RunKind, TriggerInfo>> =
+    raw.lastTriggers ?? {};
+  lastTriggers[kind] = { trigger, at: now };
+  await ext.storage.local.set({ locks, lastTriggers });
+  return true;
+}
+
+async function releaseLock(kind: RunKind): Promise<void> {
+  const raw = await ext.storage.local.get(["locks"]);
+  const locks: Partial<Record<RunKind, RunLock>> = raw.locks ?? {};
+  if (locks[kind]) {
+    delete locks[kind];
+    await ext.storage.local.set({ locks });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,19 +384,30 @@ async function runCheckinForGame(
   }
 }
 
-async function runCheckinAll(): Promise<void> {
-  const state = await loadState();
-  const session = await probeSession(); // one probe shared by all games
-  for (const game of GAMES) {
-    if (!state.settings.games[game.key]?.checkin) continue;
-    await runCheckinForGame(game, state, session);
-    await sleep(jitter(800)); // pacing between games
+async function runCheckinAll(trigger: Trigger): Promise<void> {
+  if (activeRuns.has("checkin")) return; // already running in this instance
+  activeRuns.add("checkin");
+  try {
+    if (!(await acquireLock("checkin", trigger))) return; // fresh lock held
+    try {
+      const state = await loadState();
+      const session = await probeSession(); // one probe shared by all games
+      for (const game of GAMES) {
+        if (!state.settings.games[game.key]?.checkin) continue;
+        await runCheckinForGame(game, state, session);
+        await sleep(jitter(800)); // pacing between games
+      }
+      state.lastCheckinRun = Date.now();
+      await saveState({
+        runs: state.runs,
+        lastCheckinRun: state.lastCheckinRun,
+      });
+    } finally {
+      await releaseLock("checkin");
+    }
+  } finally {
+    activeRuns.delete("checkin");
   }
-  state.lastCheckinRun = Date.now();
-  await saveState({
-    runs: state.runs,
-    lastCheckinRun: state.lastCheckinRun,
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -513,20 +589,31 @@ async function runCodesForGame(
   };
 }
 
-async function runCodesAll(): Promise<void> {
-  const state = await loadState();
-  const session = await probeSession(); // one probe shared by all games
-  for (const game of GAMES) {
-    if (!state.settings.games[game.key]?.codes) continue;
-    await runCodesForGame(game, state, session);
-    await saveState({
-      runs: state.runs,
-      attempts: state.attempts,
-      stats: state.stats,
-    });
+async function runCodesAll(trigger: Trigger): Promise<void> {
+  if (activeRuns.has("codes")) return; // already running in this instance
+  activeRuns.add("codes");
+  try {
+    if (!(await acquireLock("codes", trigger))) return; // fresh lock held
+    try {
+      const state = await loadState();
+      const session = await probeSession(); // one probe shared by all games
+      for (const game of GAMES) {
+        if (!state.settings.games[game.key]?.codes) continue;
+        await runCodesForGame(game, state, session);
+        await saveState({
+          runs: state.runs,
+          attempts: state.attempts,
+          stats: state.stats,
+        });
+      }
+      state.lastCodesRun = Date.now();
+      await saveState({ lastCodesRun: state.lastCodesRun });
+    } finally {
+      await releaseLock("codes");
+    }
+  } finally {
+    activeRuns.delete("codes");
   }
-  state.lastCodesRun = Date.now();
-  await saveState({ lastCodesRun: state.lastCodesRun });
 }
 
 // ---------------------------------------------------------------------------
@@ -569,39 +656,39 @@ function ensureAlarms(): void {
 ensureAlarms();
 
 ext.alarms.onAlarm.addListener((alarm: any) => {
-  if (alarm.name === ALARM_CHECKIN) void runCheckinAll();
-  if (alarm.name === ALARM_CODES) void runCodesAll();
+  if (alarm.name === ALARM_CHECKIN) void runCheckinAll("alarm");
+  if (alarm.name === ALARM_CODES) void runCodesAll("alarm");
 });
 
 function localDateKey(d = new Date()): string {
   return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
 }
 
-async function catchUp(): Promise<void> {
+async function catchUp(trigger: Trigger): Promise<void> {
   const state = await loadState();
   const lastDay = state.lastCheckinRun
     ? localDateKey(new Date(state.lastCheckinRun))
     : null;
-  if (lastDay !== localDateKey()) void runCheckinAll();
-  void runCodesAll();
+  if (lastDay !== localDateKey()) void runCheckinAll(trigger);
+  void runCodesAll(trigger);
 }
 
 ext.runtime.onStartup.addListener(() => {
   ensureAlarms();
-  void catchUp();
+  void catchUp("startup");
 });
 
 ext.runtime.onInstalled.addListener(() => {
   ensureAlarms();
-  void catchUp();
+  void catchUp("installed");
 });
 
 // Popup messaging
 ext.runtime.onMessage.addListener((msg: any) => {
   if (msg?.type === "run-now") {
     const jobs: Promise<void>[] = [];
-    if (msg.scope === "checkin" || msg.scope === "all") jobs.push(runCheckinAll());
-    if (msg.scope === "codes" || msg.scope === "all") jobs.push(runCodesAll());
+    if (msg.scope === "checkin" || msg.scope === "all") jobs.push(runCheckinAll("manual"));
+    if (msg.scope === "codes" || msg.scope === "all") jobs.push(runCodesAll("manual"));
     return Promise.all(jobs).then(() => ({ ok: true }));
   }
   if (msg?.type === "games") {

@@ -61,6 +61,8 @@ async function loadState() {
         "lastCodesRun",
         "attempts",
         "stats",
+        "locks",
+        "lastTriggers",
     ]);
     return {
         settings: {
@@ -71,10 +73,51 @@ async function loadState() {
         lastCodesRun: raw.lastCodesRun,
         attempts: raw.attempts ?? {},
         stats: raw.stats ?? { totalRedeemed: 0, activeCounts: {} },
+        locks: raw.locks ?? {},
+        lastTriggers: raw.lastTriggers ?? {},
     };
 }
 async function saveState(patch) {
     await ext.storage.local.set(patch);
+}
+// ---------------------------------------------------------------------------
+// Single-flight locks (duplicate-run guard)
+// ---------------------------------------------------------------------------
+/** A lock older than this is assumed to belong to a crashed/unloaded run
+ *  and is taken over. A full codes run takes minutes (pacing per code),
+ *  so 15 minutes leaves generous headroom over a legitimate run. */
+const LOCK_TTL_MS = 15 * 60 * 1000;
+/** In-memory first line of defense: alarms, startup and popup messages are
+ *  normally dispatched to this same background instance while it is alive,
+ *  so a synchronous Set check closes the common overlap race before the
+ *  async storage lock is even consulted. The storage lock below is the
+ *  durable layer that survives background unloads. */
+const activeRuns = new Set();
+/** Tries to take the lock for `kind` and records the trigger. Returns false
+ *  when a fresh lock is already held (caller must skip its run). A stale
+ *  lock is overwritten (takeover). Storage get/set is not atomic, so two
+ *  brand-new background instances racing in the same instant could both
+ *  pass; the in-memory set above covers the realistic same-instance case. */
+async function acquireLock(kind, trigger) {
+    const raw = await ext.storage.local.get(["locks", "lastTriggers"]);
+    const locks = raw.locks ?? {};
+    const now = Date.now();
+    const existing = locks[kind];
+    if (existing && now - existing.at < LOCK_TTL_MS)
+        return false;
+    locks[kind] = { at: now, trigger };
+    const lastTriggers = raw.lastTriggers ?? {};
+    lastTriggers[kind] = { trigger, at: now };
+    await ext.storage.local.set({ locks, lastTriggers });
+    return true;
+}
+async function releaseLock(kind) {
+    const raw = await ext.storage.local.get(["locks"]);
+    const locks = raw.locks ?? {};
+    if (locks[kind]) {
+        delete locks[kind];
+        await ext.storage.local.set({ locks });
+    }
 }
 // ---------------------------------------------------------------------------
 // Helpers: jitter, backoff, fetch
@@ -196,20 +239,35 @@ async function runCheckinForGame(game, state, session) {
         };
     }
 }
-async function runCheckinAll() {
-    const state = await loadState();
-    const session = await probeSession(); // one probe shared by all games
-    for (const game of GAMES) {
-        if (!state.settings.games[game.key]?.checkin)
-            continue;
-        await runCheckinForGame(game, state, session);
-        await sleep(jitter(800)); // pacing between games
+async function runCheckinAll(trigger) {
+    if (activeRuns.has("checkin"))
+        return; // already running in this instance
+    activeRuns.add("checkin");
+    try {
+        if (!(await acquireLock("checkin", trigger)))
+            return; // fresh lock held
+        try {
+            const state = await loadState();
+            const session = await probeSession(); // one probe shared by all games
+            for (const game of GAMES) {
+                if (!state.settings.games[game.key]?.checkin)
+                    continue;
+                await runCheckinForGame(game, state, session);
+                await sleep(jitter(800)); // pacing between games
+            }
+            state.lastCheckinRun = Date.now();
+            await saveState({
+                runs: state.runs,
+                lastCheckinRun: state.lastCheckinRun,
+            });
+        }
+        finally {
+            await releaseLock("checkin");
+        }
     }
-    state.lastCheckinRun = Date.now();
-    await saveState({
-        runs: state.runs,
-        lastCheckinRun: state.lastCheckinRun,
-    });
+    finally {
+        activeRuns.delete("checkin");
+    }
 }
 async function fetchCodes(game) {
     const json = await fetchJsonWithRetry(`${CODES_API}?game=${encodeURIComponent(game.codesGame)}`, { method: "GET" });
@@ -368,21 +426,36 @@ async function runCodesForGame(game, state, session) {
         },
     };
 }
-async function runCodesAll() {
-    const state = await loadState();
-    const session = await probeSession(); // one probe shared by all games
-    for (const game of GAMES) {
-        if (!state.settings.games[game.key]?.codes)
-            continue;
-        await runCodesForGame(game, state, session);
-        await saveState({
-            runs: state.runs,
-            attempts: state.attempts,
-            stats: state.stats,
-        });
+async function runCodesAll(trigger) {
+    if (activeRuns.has("codes"))
+        return; // already running in this instance
+    activeRuns.add("codes");
+    try {
+        if (!(await acquireLock("codes", trigger)))
+            return; // fresh lock held
+        try {
+            const state = await loadState();
+            const session = await probeSession(); // one probe shared by all games
+            for (const game of GAMES) {
+                if (!state.settings.games[game.key]?.codes)
+                    continue;
+                await runCodesForGame(game, state, session);
+                await saveState({
+                    runs: state.runs,
+                    attempts: state.attempts,
+                    stats: state.stats,
+                });
+            }
+            state.lastCodesRun = Date.now();
+            await saveState({ lastCodesRun: state.lastCodesRun });
+        }
+        finally {
+            await releaseLock("codes");
+        }
     }
-    state.lastCodesRun = Date.now();
-    await saveState({ lastCodesRun: state.lastCodesRun });
+    finally {
+        activeRuns.delete("codes");
+    }
 }
 // ---------------------------------------------------------------------------
 // Scheduling — listeners are registered synchronously at top level, as
@@ -421,38 +494,38 @@ function ensureAlarms() {
 ensureAlarms();
 ext.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === ALARM_CHECKIN)
-        void runCheckinAll();
+        void runCheckinAll("alarm");
     if (alarm.name === ALARM_CODES)
-        void runCodesAll();
+        void runCodesAll("alarm");
 });
 function localDateKey(d = new Date()) {
     return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
 }
-async function catchUp() {
+async function catchUp(trigger) {
     const state = await loadState();
     const lastDay = state.lastCheckinRun
         ? localDateKey(new Date(state.lastCheckinRun))
         : null;
     if (lastDay !== localDateKey())
-        void runCheckinAll();
-    void runCodesAll();
+        void runCheckinAll(trigger);
+    void runCodesAll(trigger);
 }
 ext.runtime.onStartup.addListener(() => {
     ensureAlarms();
-    void catchUp();
+    void catchUp("startup");
 });
 ext.runtime.onInstalled.addListener(() => {
     ensureAlarms();
-    void catchUp();
+    void catchUp("installed");
 });
 // Popup messaging
 ext.runtime.onMessage.addListener((msg) => {
     if (msg?.type === "run-now") {
         const jobs = [];
         if (msg.scope === "checkin" || msg.scope === "all")
-            jobs.push(runCheckinAll());
+            jobs.push(runCheckinAll("manual"));
         if (msg.scope === "codes" || msg.scope === "all")
-            jobs.push(runCodesAll());
+            jobs.push(runCodesAll("manual"));
         return Promise.all(jobs).then(() => ({ ok: true }));
     }
     if (msg?.type === "games") {

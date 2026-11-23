@@ -19,6 +19,15 @@ const RESULT_LABEL = {
     auth_error: "認証エラー",
     error: "エラー",
 };
+/** Why a run started (recorded by the background in storage). */
+const TRIGGER_LABEL = {
+    alarm: "定期実行",
+    startup: "起動時",
+    installed: "インストール時",
+    manual: "手動",
+};
+/** Must match LOCK_TTL_MS in background.ts: older locks are stale. */
+const LOCK_FRESH_MS = 15 * 60 * 1000;
 function fmtTime(at) {
     if (!at)
         return "未実行";
@@ -39,10 +48,14 @@ async function render() {
         "lastCheckinRun",
         "lastCodesRun",
         "stats",
+        "locks",
+        "lastTriggers",
     ]);
     const settings = raw.settings ?? { games: {} };
     const runs = raw.runs ?? {};
     const stats = raw.stats ?? { totalRedeemed: 0, activeCounts: {} };
+    const locks = raw.locks ?? {};
+    const lastTriggers = raw.lastTriggers ?? {};
     const container = document.getElementById("games");
     container.innerHTML = "";
     for (const game of GAMES) {
@@ -88,11 +101,32 @@ async function render() {
         div.append(h, row, status);
         container.appendChild(div);
     }
+    // Footer: an in-flight run is shown as 実行中 (with its trigger) instead of
+    // looking like a fresh re-run; otherwise the last run time is labelled
+    // with the trigger that started it.
+    const runningLine = (kind, label) => {
+        const lock = locks[kind];
+        if (lock && Date.now() - lock.at < LOCK_FRESH_MS) {
+            const trig = TRIGGER_LABEL[lock.trigger] ?? lock.trigger;
+            return `${label}: 実行中（${trig}・${fmtTime(lock.at)}開始）`;
+        }
+        return null;
+    };
+    const lastLine = (kind, label, at) => {
+        const info = lastTriggers[kind];
+        const trig = info ? `（${TRIGGER_LABEL[info.trigger] ?? info.trigger}）` : "";
+        return `最終${label}実行: ${fmtTime(at)}${trig}`;
+    };
+    const footerLines = [];
+    const rc = runningLine("checkin", "チェックイン");
+    if (rc)
+        footerLines.push(rc);
+    const rd = runningLine("codes", "コード");
+    if (rd)
+        footerLines.push(rd);
+    footerLines.push(lastLine("checkin", "チェックイン", raw.lastCheckinRun), lastLine("codes", "コード", raw.lastCodesRun), `累計交換成功: ${stats.totalRedeemed ?? 0}件`);
     const footer = document.getElementById("footer");
-    footer.textContent =
-        `最終チェックイン実行: ${fmtTime(raw.lastCheckinRun)}\n` +
-            `最終コード実行: ${fmtTime(raw.lastCodesRun)}\n` +
-            `累計交換成功: ${stats.totalRedeemed ?? 0}件`;
+    footer.textContent = footerLines.join("\n");
 }
 document.getElementById("run-now").addEventListener("click", async (ev) => {
     const btn = ev.currentTarget;
